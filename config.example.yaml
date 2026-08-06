@@ -1,0 +1,28 @@
+sequences:
+  - id: demo
+    lidar_dir: ./data/demo/lidar
+    label_dir: ./data/demo/label
+    point_format: xyz_i_float32_le
+    frame_rate: 10
+
+classes:
+  - id: Car
+    label: Car
+    color: '#3B82F6'
+    default_size: [4.5, 2.0, 1.6]
+  - id: Truck
+    label: Truck
+    color: '#F97316'
+    default_size: [10.0, 2.8, 3.8]
+  - id: Chemical
+    label: Chemical
+    color: '#A855F7'
+    default_size: [10.0, 3.0, 3.5]
+  - id: Pedestrain
+    label: Pedestrian
+    color: '#22C55E'
+    default_size: [0.7, 0.7, 1.6]
+
+server:
+  host: 127.0.0.1
+  port: 8000
