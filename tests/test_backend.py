@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app import create_app
-from backend.config import AppConfig, SequenceConfig
+from backend.config import AppConfig, SequenceConfig, load_config
 from backend.indexer import index_sequence
 from backend.labels import load_labels, save_labels, validate_labels
 from backend.pointcloud import point_count, read_first_points
@@ -136,3 +136,35 @@ def test_api_lidar_only_sequence_uses_sibling_label_dir(tmp_path: Path) -> None:
     response = client.put("/api/sequences/demo/frames/frame1/labels", json={"boxes": []})
     assert response.status_code == 200
     assert (tmp_path / "sequence" / "label" / "frame1.json").is_file()
+
+
+def test_ai_box_config_is_merged_and_exposed(tmp_path: Path) -> None:
+    lidar = tmp_path / "lidar"
+    lidar.mkdir()
+    write_bin(lidar / "frame1.bin", [(1, 2, 3, 4)])
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "sequences:",
+                "  - id: demo",
+                "    lidar_dir: ./lidar",
+                "ai_box:",
+                "  roadGap: 0.25",
+                "  angleSearch:",
+                "    round2Count: 17",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.ai_box["roadGap"] == 0.25
+    assert config.ai_box["roadGridSize"] == 2.0
+    assert config.ai_box["angleSearch"] == {
+        "round1Count": 10,
+        "round2Count": 17,
+        "round3Count": 9,
+    }
+    response = TestClient(create_app(config)).get("/api/config/ai-box")
+    assert response.status_code == 200
+    assert response.json()["roadGap"] == 0.25

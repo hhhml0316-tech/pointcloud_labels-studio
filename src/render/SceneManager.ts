@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import type { ClassConfig, LabelBox, PointFrame, Vec3 } from '../types'
+import { projectCornersToRect } from '../ai-box/interaction.js'
+import type { AIBoxSelection, ClassConfig, LabelBox, PointFrame, Vec3 } from '../types'
 
 export type ViewName = 'main' | 'bev' | 'front' | 'side'
 
@@ -9,9 +10,11 @@ type Viewport = { x: number; y: number; width: number; height: number }
 type DragState = {
   view: Exclude<ViewName, 'main'>
   boxId: string
+  pointerId: number
   plane: THREE.Plane
   startPoint: THREE.Vector3
   startPosition: THREE.Vector3
+  change: BoxTransformChange
 }
 
 export type BoxTransformChange = {
@@ -39,9 +42,26 @@ type MainBoxLabel = {
   center: THREE.Vector3
 }
 
+type BoxDrawState = {
+  pointerId: number
+  startClient: { x: number; y: number }
+  startNdc: THREE.Vector2
+}
+
 const EDITOR_BOX_RANGE_RATIO = 1.5
 const EDITOR_CONTEXT_DEPTH_RATIO = 3
-const MAIN_VIEW_FILL_RATIO = 0.82
+
+const POINT_COLOR_LUT = (() => {
+  const values = new Float32Array(256 * 3)
+  const color = new THREE.Color()
+  for (let index = 0; index < 256; index += 1) {
+    color.setHSL(0.66 - (index / 255) * 0.66, 0.85, 0.55)
+    values[index * 3] = color.r
+    values[index * 3 + 1] = color.g
+    values[index * 3 + 2] = color.b
+  }
+  return values
+})()
 
 type ControlDrag = {
   view: Exclude<ViewName, 'main'>
@@ -54,6 +74,7 @@ type ControlDrag = {
   startPosition: Vec3
   startScale: Vec3
   startRotation: Vec3
+  change: BoxTransformChange
 }
 
 /**
@@ -68,7 +89,8 @@ export class SceneManager {
   private readonly mainOverlay: HTMLDivElement
   private readonly editorCanvas: HTMLCanvasElement
   private readonly editorOverlay: HTMLDivElement
-  private readonly mainCamera = new THREE.PerspectiveCamera(55, 1, 0.1, 10000)
+  private readonly mainCamera = new THREE.PerspectiveCamera(65, 1, 0.1, 10000)
+  private readonly boxCreationCamera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 10000)
   private readonly bevCamera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 10000)
   private readonly frontCamera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 10000)
   private readonly sideCamera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 10000)
@@ -95,6 +117,13 @@ export class SceneManager {
   private controlDrag: ControlDrag | null = null
   private shouldFitMainView = true
   private mainBoxLabels: MainBoxLabel[] = []
+  private currentBoxes: LabelBox[] = []
+  private readonly boxSelectionRect = document.createElement('div')
+  private boxCreationMode = false
+  private boxDrawState: BoxDrawState | null = null
+  private previewBox: LabelBox | null = null
+  private pointBounds: THREE.Sphere | null = null
+  private boxCreationHalfHeight = 100
 
   constructor(
     mainCanvas: HTMLCanvasElement,
@@ -104,6 +133,8 @@ export class SceneManager {
     private readonly onSelect: (id: string | null) => void,
     private readonly onTransform: (id: string, change: BoxTransformChange) => void,
     private readonly onMoveEnd: () => void,
+    private readonly onCreateRegion: (selection: AIBoxSelection) => void,
+    private readonly onBoxContextMenu: (id: string, clientX: number, clientY: number) => void,
   ) {
     this.mainCanvas = mainCanvas
     this.mainOverlay = mainOverlay
@@ -120,17 +151,29 @@ export class SceneManager {
     this.pointGroup.layers.enable(1)
     this.boxGroup.layers.enable(1)
     this.createEditorOverlay()
+    this.boxSelectionRect.className = 'ai-box-selection-rect'
+    this.boxSelectionRect.hidden = true
+    this.mainOverlay.append(this.boxSelectionRect)
     this.scene.add(this.pointGroup, this.boxGroup)
     this.scene.add(new THREE.AmbientLight(0xffffff, 1))
     this.scene.add(new THREE.AxesHelper(5))
 
+    // SUSTechPOINTS treats Z as the vertical axis. OrbitControls derives all
+    // azimuth/polar movement from camera.up, so using Three.js' Y-up default
+    // makes a point-cloud scene orbit around the wrong world axis.
+    this.mainCamera.up.set(0, 0, 1)
+    this.mainCamera.position.set(0, -0.01, 50)
+    this.mainCamera.lookAt(0, 0, 0)
     this.controls = new OrbitControls(this.mainCamera, mainCanvas)
-    this.controls.enableDamping = true
-    this.controls.dampingFactor = 0.08
-    this.controls.screenSpacePanning = true
+    this.controls.enableDamping = false
+    this.controls.screenSpacePanning = false
     this.controls.enableRotate = true
 
     this.mainCanvas.addEventListener('pointerdown', this.handleMainPointerDown)
+    this.mainCanvas.addEventListener('pointermove', this.handleMainPointerMove)
+    this.mainCanvas.addEventListener('pointerup', this.handleMainPointerUp)
+    this.mainCanvas.addEventListener('pointercancel', this.handleMainPointerCancel)
+    this.mainCanvas.addEventListener('contextmenu', this.handleMainContextMenu)
     this.editorCanvas.addEventListener('pointerdown', this.handleEditorPointerDown)
     this.editorCanvas.addEventListener('pointermove', this.handleEditorPointerMove)
     window.addEventListener('pointerup', this.handlePointerUp)
@@ -149,6 +192,57 @@ export class SceneManager {
 
   fitMainViewOnNextFrame() {
     this.shouldFitMainView = true
+  }
+
+  setBoxCreationMode(enabled: boolean) {
+    const drawPointerId = this.boxDrawState?.pointerId
+    if (drawPointerId !== undefined && this.mainCanvas.hasPointerCapture(drawPointerId)) {
+      this.mainCanvas.releasePointerCapture(drawPointerId)
+    }
+    this.boxCreationMode = enabled
+    this.boxDrawState = null
+    this.boxSelectionRect.hidden = true
+    this.boxSelectionRect.removeAttribute('style')
+    this.controls.enabled = !enabled
+    this.mainCanvas.classList.toggle('box-creation-active', enabled)
+    this.clearMainBoxLabels()
+    if (enabled) {
+      this.configureBoxCreationCamera()
+    } else {
+      this.currentBoxes.forEach((box) => this.addMainBoxLabel(box))
+      // Reproject immediately with the restored perspective camera. This keeps
+      // labels from spending even one frame at their former BEV coordinates.
+      this.updateMainBoxLabels()
+    }
+  }
+
+  getBoxFitSelection(box: LabelBox, paddingRatio: number): AIBoxSelection | null {
+    this.mainCamera.updateMatrixWorld(true)
+    const viewProjMatrix = this.mainViewProjection()
+    const half = {
+      x: Math.abs(box.psr.scale.x) * 0.5,
+      y: Math.abs(box.psr.scale.y) * 0.5,
+      z: Math.abs(box.psr.scale.z) * 0.5,
+    }
+    const rotation = new THREE.Euler(box.psr.rotation.x, box.psr.rotation.y, box.psr.rotation.z, 'XYZ')
+    const center = new THREE.Vector3(box.psr.position.x, box.psr.position.y, box.psr.position.z)
+    const corners: number[] = []
+    for (const x of [-half.x, half.x]) {
+      for (const y of [-half.y, half.y]) {
+        for (const z of [-half.z, half.z]) {
+          const corner = new THREE.Vector3(x, y, z).applyEuler(rotation).add(center)
+          corners.push(corner.x, corner.y, corner.z, 1)
+        }
+      }
+    }
+    const projectRect = projectCornersToRect(corners, viewProjMatrix, paddingRatio)
+    if (!projectRect) return null
+    return {
+      projectRect,
+      viewProjMatrix,
+      headAngle: box.psr.rotation.z,
+      worldCenter: { ...box.psr.position },
+    }
   }
 
   setPoints(data: PointFrame) {
@@ -177,6 +271,8 @@ export class SceneManager {
     this.points.layers.set(0)
     this.pointGroup.add(this.points)
     geometry.computeBoundingSphere()
+    this.pointBounds = geometry.boundingSphere?.clone() ?? null
+    if (this.boxCreationMode) this.configureBoxCreationCamera()
     if (this.shouldFitMainView) {
       this.fitToPoints(data.positions)
       this.shouldFitMainView = false
@@ -187,6 +283,7 @@ export class SceneManager {
 
   setBoxes(boxes: LabelBox[], selectedId: string | null) {
     this.selectedId = selectedId
+    this.currentBoxes = [...boxes]
     for (const child of [...this.boxGroup.children]) {
       this.boxGroup.remove(child)
       child.traverse((node) => {
@@ -198,11 +295,11 @@ export class SceneManager {
         }
       })
     }
-    this.mainOverlay.replaceChildren()
+    this.mainOverlay.replaceChildren(this.boxSelectionRect)
     this.mainBoxLabels = []
     boxes.forEach((box) => {
       this.addBox(box)
-      this.addMainBoxLabel(box)
+      if (!this.boxCreationMode) this.addMainBoxLabel(box)
     })
     const selectedBox = boxes.find((box) => String(box.obj_id) === selectedId)
     this.selectedBoxModel = selectedBox ?? null
@@ -231,7 +328,7 @@ export class SceneManager {
     this.mainRenderer.setScissorTest(false)
     this.mainRenderer.setViewport(0, 0, mainWidth, mainHeight)
     this.mainRenderer.clear()
-    this.mainRenderer.render(this.scene, this.mainCamera)
+    this.mainRenderer.render(this.scene, this.activeMainCamera())
     this.updateMainBoxLabels()
 
     const editorWidth = Math.max(1, this.editorCanvas.clientWidth)
@@ -268,11 +365,16 @@ export class SceneManager {
     this.updateOrtho(this.sideCamera, this.editorViewports.side, 100)
     this.mainCamera.aspect = mainWidth / Math.max(1, mainHeight)
     this.mainCamera.updateProjectionMatrix()
+    this.updateOrtho(this.boxCreationCamera, this.mainViewport, this.boxCreationHalfHeight)
     this.layoutEditorOverlay(editorWidth, editorHeight)
   }
 
   dispose() {
     this.mainCanvas.removeEventListener('pointerdown', this.handleMainPointerDown)
+    this.mainCanvas.removeEventListener('pointermove', this.handleMainPointerMove)
+    this.mainCanvas.removeEventListener('pointerup', this.handleMainPointerUp)
+    this.mainCanvas.removeEventListener('pointercancel', this.handleMainPointerCancel)
+    this.mainCanvas.removeEventListener('contextmenu', this.handleMainContextMenu)
     this.editorCanvas.removeEventListener('pointerdown', this.handleEditorPointerDown)
     this.editorCanvas.removeEventListener('pointermove', this.handleEditorPointerMove)
     window.removeEventListener('pointerup', this.handlePointerUp)
@@ -325,8 +427,8 @@ export class SceneManager {
       for (const name of handleOrder) {
         const handle = document.createElementNS(svgNamespace, 'rect')
         handle.classList.add('box-control-handle', `box-control-${name}`)
-        handle.setAttribute('width', '10')
-        handle.setAttribute('height', '10')
+        handle.setAttribute('width', '16')
+        handle.setAttribute('height', '16')
         handle.style.pointerEvents = 'all'
         handle.addEventListener('pointerdown', (event) => this.beginControlDrag(event, view, 'scale', directions[name]))
         handles[name] = handle
@@ -366,16 +468,15 @@ export class SceneManager {
   }
 
   private viewAxisSpec(view: Exclude<ViewName, 'main'>): ViewAxisSpec {
-    if (view === 'bev') return { u: 'x', v: 'y', rotation: 'z', normal: new THREE.Vector3(0, 0, 1) }
+    // Match SUST's projective cameras exactly: TOP uses local +X as screen-up
+    // and local -Y as screen-right; the two elevation views use local +Z up.
+    if (view === 'bev') return { u: 'y', v: 'x', rotation: 'z', normal: new THREE.Vector3(0, 0, 1) }
     if (view === 'front') return { u: 'x', v: 'z', rotation: 'y', normal: new THREE.Vector3(0, 1, 0) }
     return { u: 'y', v: 'z', rotation: 'x', normal: new THREE.Vector3(1, 0, 0) }
   }
 
   private screenAxisSigns(view: Exclude<ViewName, 'main'>) {
-    // With the SUST front/end convention, SIDE looks along +X, therefore
-    // local +Y appears on the screen's left.  The other two views preserve
-    // local +U as screen-right.
-    return { u: view === 'side' ? -1 : 1, v: 1 }
+    return { u: view === 'front' ? 1 : -1, v: 1 }
   }
 
   private projectPoint(point: THREE.Vector3, view: Exclude<ViewName, 'main'>) {
@@ -388,8 +489,8 @@ export class SceneManager {
   }
 
   private projectBox(view: Exclude<ViewName, 'main'>) {
-    if (!this.selectedBoxModel) return null
-    const box = this.selectedBoxModel
+    const box = this.previewBox ?? this.selectedBoxModel
+    if (!box) return null
     const spec = this.viewAxisSpec(view)
     const position = new THREE.Vector3(box.psr.position.x, box.psr.position.y, box.psr.position.z)
     const rotation = new THREE.Euler(box.psr.rotation.x, box.psr.rotation.y, box.psr.rotation.z, 'XYZ')
@@ -429,8 +530,31 @@ export class SceneManager {
       element.setAttribute('cx', `${point.x}`)
       element.setAttribute('cy', `${point.y}`)
     } else {
-      element.setAttribute('x', `${point.x - 6}`)
-      element.setAttribute('y', `${point.y - 6}`)
+      element.setAttribute('x', `${point.x - 8}`)
+      element.setAttribute('y', `${point.y - 8}`)
+    }
+  }
+
+  private directionToViewportEdge(
+    center: { x: number; y: number },
+    direction: { x: number; y: number },
+    viewport: Viewport,
+  ) {
+    const margin = 10
+    const candidates: number[] = []
+    if (Math.abs(direction.x) > 1e-6) {
+      candidates.push((margin - center.x) / direction.x)
+      candidates.push((viewport.width - margin - center.x) / direction.x)
+    }
+    if (Math.abs(direction.y) > 1e-6) {
+      candidates.push((margin - center.y) / direction.y)
+      candidates.push((viewport.height - margin - center.y) / direction.y)
+    }
+    const distance = Math.min(...candidates.filter((value) => value > 0))
+    if (!Number.isFinite(distance)) return center
+    return {
+      x: center.x + direction.x * distance,
+      y: center.y + direction.y * distance,
     }
   }
 
@@ -448,10 +572,8 @@ export class SceneManager {
       }
       const direction = { x: top.x - projection.center.x, y: top.y - projection.center.y }
       const directionLength = Math.max(1, Math.hypot(direction.x, direction.y))
-      const rotationHandle = {
-        x: top.x + direction.x / directionLength * 28,
-        y: top.y + direction.y / directionLength * 28,
-      }
+      const directionUnit = { x: direction.x / directionLength, y: direction.y / directionLength }
+      const rotationHandle = this.directionToViewportEdge(projection.center, directionUnit, this.editorViewports[view])
       overlay.direction.setAttribute('x1', `${projection.center.x}`)
       overlay.direction.setAttribute('y1', `${projection.center.y}`)
       overlay.direction.setAttribute('x2', `${rotationHandle.x}`)
@@ -502,7 +624,7 @@ export class SceneManager {
       x: viewportRect.left + projection.center.x,
       y: viewportRect.top + overlayTop + projection.center.y,
     }
-    this.controlDrag = {
+      this.controlDrag = {
       view,
       kind,
       direction,
@@ -513,7 +635,9 @@ export class SceneManager {
       startPosition: { ...box.psr.position },
       startScale: { ...box.psr.scale },
       startRotation: { ...box.psr.rotation },
+      change: {},
     }
+    this.previewBox = this.cloneBox(box)
     window.addEventListener('pointermove', this.handleControlPointerMove)
     window.addEventListener('pointerup', this.handleControlPointerUp)
     this.editorCanvas.style.cursor = kind === 'rotate' ? 'crosshair' : kind === 'scale' ? 'nwse-resize' : 'move'
@@ -551,7 +675,9 @@ export class SceneManager {
       const screenU = this.screenAxisSigns(drag.view).u
       const rotationQuaternion = new THREE.Quaternion().setFromAxisAngle(axis, -handedness * screenU * delta)
       const rotation = new THREE.Euler().setFromQuaternion(startQuaternion.multiply(rotationQuaternion), 'XYZ')
-      this.onTransform(String(box.obj_id), { rotation })
+      const change = { rotation: { x: rotation.x, y: rotation.y, z: rotation.z } }
+      drag.change = change
+      this.applyBoxPreview(change)
       return
     }
     const raycaster = new THREE.Raycaster()
@@ -578,11 +704,13 @@ export class SceneManager {
         delta.dot(worldV),
         0,
       )
-      this.onTransform(String(box.obj_id), { position: {
+      const change = { position: {
         x: drag.startPosition.x + worldU.x * localDelta.x + worldV.x * localDelta.y,
         y: drag.startPosition.y + worldU.y * localDelta.x + worldV.y * localDelta.y,
         z: drag.startPosition.z + worldU.z * localDelta.x + worldV.z * localDelta.y,
-      } })
+      } }
+      drag.change = change
+      this.applyBoxPreview(change)
       return
     }
     const position = { ...drag.startPosition }
@@ -600,15 +728,20 @@ export class SceneManager {
       position.y += worldAxis.y * actualAmount * sign
       position.z += worldAxis.z * actualAmount * sign
     }
-    this.onTransform(String(box.obj_id), { position, scale })
+    drag.change = { position, scale }
+    this.applyBoxPreview(drag.change)
   }
 
   private handleControlPointerUp = () => {
-    if (!this.controlDrag) return
+    const drag = this.controlDrag
+    const boxId = this.selectedBoxModel ? String(this.selectedBoxModel.obj_id) : null
+    if (!drag) return
     this.controlDrag = null
     window.removeEventListener('pointermove', this.handleControlPointerMove)
     window.removeEventListener('pointerup', this.handleControlPointerUp)
     this.editorCanvas.style.cursor = ''
+    this.previewBox = null
+    if (boxId && Object.keys(drag.change).length) this.onTransform(boxId, drag.change)
     if (this.selectedBoxModel) this.focusEditorBox(this.selectedBoxModel)
     this.onMoveEnd()
   }
@@ -618,6 +751,36 @@ export class SceneManager {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
     renderer.setClearColor(0x0b1220, transparent ? 0 : 1)
     return renderer
+  }
+
+  private cloneBox(box: LabelBox): LabelBox {
+    return {
+      ...box,
+      psr: {
+        position: { ...box.psr.position },
+        scale: { ...box.psr.scale },
+        rotation: { ...box.psr.rotation },
+      },
+    }
+  }
+
+  /**
+   * SUST keeps pointer-move work inside the projective editor and commits the
+   * annotation once on mouse-up. Doing the same here avoids Vue rebuilding all
+   * boxes and re-cropping the local point cloud for every pointer event.
+   */
+  private applyBoxPreview(change: BoxTransformChange) {
+    if (!this.previewBox) return
+    if (change.position) this.previewBox.psr.position = { ...change.position }
+    if (change.scale) this.previewBox.psr.scale = { ...change.scale }
+    if (change.rotation) this.previewBox.psr.rotation = { ...change.rotation }
+    const id = String(this.previewBox.obj_id)
+    const group = this.boxGroup.children.find((child) => String(child.userData.boxId) === id)
+    if (!group) return
+    const { position, scale, rotation } = this.previewBox.psr
+    group.position.set(position.x, position.y, position.z)
+    group.scale.set(scale.x, scale.y, scale.z)
+    group.rotation.set(rotation.x, rotation.y, rotation.z)
   }
 
   private disposeObject(object: THREE.Object3D) {
@@ -639,13 +802,21 @@ export class SceneManager {
     const selected = id === this.selectedId
     const lineMaterial = new THREE.LineBasicMaterial({ color: selected ? 0xfde047 : color, transparent: true, opacity: 0.95 })
     const edges = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), lineMaterial)
+    // Match SUST's cuboid convention: a short line projects from the centre of
+    // the local +X face so every 3D box has an unambiguous heading indicator.
+    const directionGeometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0.5, 0, 0.5),
+      new THREE.Vector3(0.75, 0, 0.5),
+    ])
+    const directionLine = new THREE.LineSegments(directionGeometry, lineMaterial)
     const pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.01, depthWrite: false })
     const pickMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), pickMaterial)
-    group.add(edges, pickMesh)
+    group.add(edges, directionLine, pickMesh)
     group.userData.boxId = id
     if (selected) {
       group.layers.enable(1)
       edges.layers.enable(1)
+      directionLine.layers.enable(1)
       pickMesh.layers.enable(1)
     }
     group.position.set(box.psr.position.x, box.psr.position.y, box.psr.position.z)
@@ -669,6 +840,19 @@ export class SceneManager {
     const color = this.classes.get(box.obj_type)?.color ?? '#94A3B8'
     label.style.setProperty('--box-label-color', color)
     label.append(type, trackId)
+    label.addEventListener('pointerdown', (event) => event.stopPropagation())
+    label.addEventListener('click', (event) => {
+      event.stopPropagation()
+      this.selectedId = id
+      this.onSelect(id)
+    })
+    label.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      this.selectedId = id
+      this.onSelect(id)
+      this.onBoxContextMenu(id, event.clientX, event.clientY)
+    })
     this.mainOverlay.append(label)
     this.mainBoxLabels.push({
       element: label,
@@ -676,11 +860,17 @@ export class SceneManager {
     })
   }
 
+  private clearMainBoxLabels() {
+    for (const { element } of this.mainBoxLabels) element.remove()
+    this.mainBoxLabels = []
+  }
+
   private updateMainBoxLabels() {
     const width = Math.max(1, this.mainCanvas.clientWidth)
     const height = Math.max(1, this.mainCanvas.clientHeight)
+    const camera = this.activeMainCamera()
     for (const { element, center } of this.mainBoxLabels) {
-      const projected = center.clone().project(this.mainCamera)
+      const projected = center.clone().project(camera)
       const visible = projected.z >= -1 && projected.z <= 1
         && projected.x >= -1 && projected.x <= 1
         && projected.y >= -1 && projected.y <= 1
@@ -763,15 +953,14 @@ export class SceneManager {
         maxZ = Math.max(maxZ, data.positions[i])
       }
     }
-    const color = new THREE.Color()
     for (let i = 0; i < data.intensities.length; i += 1) {
       const value = this.colorMode === 'height'
         ? (data.positions[i * 3 + 2] - minZ) / Math.max(0.001, maxZ - minZ)
         : Math.max(0, Math.min(1, data.intensities[i] / 255))
-      color.setHSL(0.66 - value * 0.66, 0.85, 0.55)
-      colors[i * 3] = color.r
-      colors[i * 3 + 1] = color.g
-      colors[i * 3 + 2] = color.b
+      const paletteIndex = Math.max(0, Math.min(255, Math.round(value * 255))) * 3
+      colors[i * 3] = POINT_COLOR_LUT[paletteIndex]
+      colors[i * 3 + 1] = POINT_COLOR_LUT[paletteIndex + 1]
+      colors[i * 3 + 2] = POINT_COLOR_LUT[paletteIndex + 2]
     }
     return colors
   }
@@ -780,27 +969,23 @@ export class SceneManager {
     if (!positions.length) return
     const attribute = new THREE.BufferAttribute(positions, 3)
     const bounds = new THREE.Box3().setFromBufferAttribute(attribute)
-    const center = bounds.getCenter(new THREE.Vector3())
-    const size = bounds.getSize(new THREE.Vector3())
+    const sphere = bounds.getBoundingSphere(new THREE.Sphere())
+    if (!Number.isFinite(sphere.radius) || sphere.radius <= 0) return
+    const direction = this.mainCamera.position.clone().sub(this.controls.target)
+    if (direction.lengthSq() < 1e-6) direction.set(0, -0.0002, 1)
+    else direction.normalize()
     const verticalHalfFov = THREE.MathUtils.degToRad(this.mainCamera.fov * 0.5)
-    const tangent = Math.max(0.01, Math.tan(verticalHalfFov))
-    const aspect = Math.max(0.1, this.mainCamera.aspect)
-    const halfWidth = Math.max(0.5, size.x * 0.5)
-    const halfHeight = Math.max(0.5, size.y * 0.5)
-    const fitDistance = Math.max(
-      halfHeight / tangent,
-      halfWidth / (tangent * aspect),
-    ) / MAIN_VIEW_FILL_RATIO
-    const distance = Math.max(fitDistance, size.z + 1)
+    const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * Math.max(this.mainCamera.aspect, 0.1))
+    const halfFov = Math.max(0.01, Math.min(verticalHalfFov, horizontalHalfFov))
+    const distance = sphere.radius * 1.25 / Math.sin(halfFov)
 
-    this.mainCamera.position.set(center.x, center.y, center.z + distance)
-    this.mainCamera.up.set(0, 1, 0)
-    this.mainCamera.lookAt(center)
+    this.controls.target.copy(sphere.center)
+    this.mainCamera.position.copy(sphere.center).add(direction.multiplyScalar(distance))
+    this.mainCamera.up.set(0, 0, 1)
     this.mainCamera.zoom = 1
-    this.mainCamera.near = 0.1
-    this.mainCamera.far = Math.max(10000, distance + size.z + 100)
+    this.mainCamera.near = Math.max(0.1, distance - sphere.radius * 2.5)
+    this.mainCamera.far = Math.max(500, distance + sphere.radius * 2.5)
     this.mainCamera.updateProjectionMatrix()
-    this.controls.target.copy(center)
     this.controls.update()
   }
 
@@ -889,23 +1074,70 @@ export class SceneManager {
     camera.updateProjectionMatrix()
   }
 
+  private activeMainCamera() {
+    return this.boxCreationMode ? this.boxCreationCamera : this.mainCamera
+  }
+
+  private configureBoxCreationCamera() {
+    const bounds = this.pointBounds
+      ?? new THREE.Sphere(this.controls.target.clone(), Math.max(10, this.mainCamera.position.distanceTo(this.controls.target) * 0.25))
+    // Keep the magnification and focus point the user established before
+    // entering creation mode. For a perspective camera, the visible vertical
+    // half-height at the orbit target is distance * tan(effectiveFov / 2),
+    // which maps directly to the orthographic camera's half-height.
+    const center = this.controls.target.clone()
+    const radius = Math.max(1, bounds.radius)
+    const focusDistance = Math.max(0.1, this.mainCamera.position.distanceTo(this.controls.target))
+    const effectiveFov = THREE.MathUtils.degToRad(this.mainCamera.getEffectiveFOV())
+    this.boxCreationHalfHeight = Math.max(0.1, focusDistance * Math.tan(effectiveFov * 0.5))
+    this.updateOrtho(this.boxCreationCamera, this.mainViewport, this.boxCreationHalfHeight)
+
+    const distance = Math.max(10, radius * 4)
+    this.boxCreationCamera.position.set(center.x, center.y, center.z + distance)
+    // Preserve the user's orbit yaw when flattening the perspective view into
+    // BEV. The horizontal direction from the camera towards its target is the
+    // perspective view's ground-plane heading, so using it as orthographic
+    // screen-up keeps objects pointing in the same on-screen direction.
+    const screenUp = center.clone().sub(this.mainCamera.position)
+    screenUp.z = 0
+    if (screenUp.lengthSq() < 1e-8) {
+      // OrbitControls normally keeps a tiny polar offset even at TOP. Keep a
+      // quaternion fallback for programmatic cameras that are exactly vertical.
+      screenUp.set(0, 1, 0).applyQuaternion(this.mainCamera.quaternion)
+      screenUp.z = 0
+    }
+    if (screenUp.lengthSq() < 1e-8) screenUp.set(1, 0, 0)
+    else screenUp.normalize()
+    this.boxCreationCamera.up.copy(screenUp)
+    this.boxCreationCamera.lookAt(center)
+    this.boxCreationCamera.near = 0.1
+    this.boxCreationCamera.far = Math.max(1000, distance + radius * 4)
+    this.boxCreationCamera.updateProjectionMatrix()
+  }
+
   private cameraFor(view: Exclude<ViewName, 'main'>) {
     if (view === 'bev') return this.bevCamera
     if (view === 'front') return this.frontCamera
     return this.sideCamera
   }
 
-  private selectFromRay(ray: THREE.Ray, layer: number) {
+  private boxIdsFromRay(ray: THREE.Ray, layer: number) {
     const raycaster = new THREE.Raycaster(ray.origin, ray.direction)
     raycaster.layers.set(layer)
     const hits = raycaster.intersectObjects(this.boxGroup.children, true)
-    const hit = hits.find((item) => item.object.parent?.userData.boxId || item.object.userData.boxId)
-    let group: THREE.Object3D | undefined
-    if (hit) {
-      group = hit.object
+    const ids: string[] = []
+    for (const hit of hits) {
+      let group: THREE.Object3D | undefined = hit.object
       while (group && !group.userData.boxId) group = group.parent ?? undefined
+      if (!group?.userData.boxId) continue
+      const id = String(group.userData.boxId)
+      if (!ids.includes(id)) ids.push(id)
     }
-    const id = group?.userData.boxId ? String(group.userData.boxId) : null
+    return ids
+  }
+
+  private selectFromRay(ray: THREE.Ray, layer: number) {
+    const id = this.boxIdsFromRay(ray, layer)[0] ?? null
     this.selectedId = id
     this.onSelect(id)
     return id
@@ -921,6 +1153,20 @@ export class SceneManager {
     return new THREE.Vector2((xLocal / Math.max(1, viewport.width)) * 2 - 1, (yLocal / Math.max(1, viewport.height)) * 2 - 1)
   }
 
+  private mainViewProjection(camera = this.activeMainCamera()) {
+    camera.updateMatrixWorld(true)
+    return new THREE.Matrix4()
+      .multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+      .elements.slice()
+  }
+
+  private worldOnGround(ndc: THREE.Vector2, camera = this.activeMainCamera()) {
+    const raycaster = new THREE.Raycaster()
+    raycaster.setFromCamera(ndc, camera)
+    const ground = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0)
+    return raycaster.ray.intersectPlane(ground, new THREE.Vector3())
+  }
+
   private editorPointer(event: PointerEvent): { view: Exclude<ViewName, 'main'>; ndc: THREE.Vector2 } | null {
     const rect = this.editorCanvas.getBoundingClientRect()
     const yTop = event.clientY - rect.top
@@ -930,13 +1176,93 @@ export class SceneManager {
   }
 
   private handleMainPointerDown = (event: PointerEvent) => {
-    const ndc = this.pointerNdc(this.mainCanvas, event, this.mainViewport)
-    const raycaster = new THREE.Raycaster()
-    raycaster.setFromCamera(ndc, this.mainCamera)
-    this.selectFromRay(raycaster.ray, 0)
+    if (this.boxCreationMode) {
+      if (event.button !== 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      const rect = this.mainCanvas.getBoundingClientRect()
+      this.boxDrawState = {
+        pointerId: event.pointerId,
+        startClient: { x: event.clientX - rect.left, y: event.clientY - rect.top },
+        startNdc: this.pointerNdc(this.mainCanvas, event, this.mainViewport),
+      }
+      this.mainCanvas.setPointerCapture(event.pointerId)
+      this.boxSelectionRect.hidden = false
+      this.updateBoxSelectionRect(this.boxDrawState.startClient, this.boxDrawState.startClient)
+      return
+    }
+  }
+
+  private updateBoxSelectionRect(start: { x: number; y: number }, end: { x: number; y: number }) {
+    this.boxSelectionRect.style.left = `${Math.min(start.x, end.x)}px`
+    this.boxSelectionRect.style.top = `${Math.min(start.y, end.y)}px`
+    this.boxSelectionRect.style.width = `${Math.abs(end.x - start.x)}px`
+    this.boxSelectionRect.style.height = `${Math.abs(end.y - start.y)}px`
+  }
+
+  private handleMainPointerMove = (event: PointerEvent) => {
+    const draw = this.boxDrawState
+    if (draw && draw.pointerId === event.pointerId) {
+      const rect = this.mainCanvas.getBoundingClientRect()
+      this.updateBoxSelectionRect(draw.startClient, {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+      })
+      return
+    }
+  }
+
+  private handleMainPointerUp = (event: PointerEvent) => {
+    const draw = this.boxDrawState
+    if (draw && draw.pointerId === event.pointerId) {
+      const rect = this.mainCanvas.getBoundingClientRect()
+      const endClient = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+      const width = Math.abs(endClient.x - draw.startClient.x)
+      const height = Math.abs(endClient.y - draw.startClient.y)
+      this.boxDrawState = null
+      this.boxSelectionRect.hidden = true
+      if (this.mainCanvas.hasPointerCapture(event.pointerId)) this.mainCanvas.releasePointerCapture(event.pointerId)
+      if (width < 4 || height < 4) return
+
+      const camera = this.activeMainCamera()
+      const endNdc = this.pointerNdc(this.mainCanvas, event, this.mainViewport)
+      const worldStart = this.worldOnGround(draw.startNdc, camera)
+      const worldEnd = this.worldOnGround(endNdc, camera)
+      if (!worldStart || !worldEnd) return
+      const viewProjMatrix = this.mainViewProjection(camera)
+      this.setBoxCreationMode(false)
+      this.onCreateRegion({
+        projectRect: [
+          { x: draw.startNdc.x, y: draw.startNdc.y },
+          { x: endNdc.x, y: endNdc.y },
+        ],
+        viewProjMatrix,
+        headAngle: Math.atan2(worldEnd.y - worldStart.y, worldEnd.x - worldStart.x),
+        worldCenter: {
+          x: (worldStart.x + worldEnd.x) * 0.5,
+          y: (worldStart.y + worldEnd.y) * 0.5,
+          z: 0,
+        },
+      })
+      return
+    }
+  }
+
+  private handleMainPointerCancel = (event: PointerEvent) => {
+    if (this.boxDrawState?.pointerId !== event.pointerId) return
+    this.boxDrawState = null
+    this.boxSelectionRect.hidden = true
+  }
+
+  private handleMainContextMenu = (event: MouseEvent) => {
+    event.preventDefault()
+    // Main-view selection and object menus are intentionally label-only.
+    // The wireframes frequently overlap in dense scenes and are too ambiguous
+    // to use as a reliable pointer target.
   }
 
   private handleEditorPointerDown = (event: PointerEvent) => {
+    if (event.button !== 0) return
     const pointer = this.editorPointer(event)
     if (!pointer) return
     const raycaster = new THREE.Raycaster()
@@ -954,16 +1280,25 @@ export class SceneManager {
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, selected.position)
     const startPoint = plane.intersectLine(new THREE.Line3(raycaster.ray.origin, raycaster.ray.origin.clone().add(raycaster.ray.direction.multiplyScalar(100000))), new THREE.Vector3())
     if (!startPoint) return
-    this.dragState = { view: pointer.view, boxId: id, plane, startPoint, startPosition: selected.position.clone() }
+    event.preventDefault()
+    this.previewBox = box ? this.cloneBox(box) : null
+    this.dragState = {
+      view: pointer.view,
+      boxId: id,
+      pointerId: event.pointerId,
+      plane,
+      startPoint,
+      startPosition: selected.position.clone(),
+      change: {},
+    }
     this.editorCanvas.setPointerCapture(event.pointerId)
   }
 
   private handleEditorPointerMove = (event: PointerEvent) => {
-    if (!this.dragState) return
-    const pointer = this.editorPointer(event)
-    if (!pointer) return
+    if (!this.dragState || this.dragState.pointerId !== event.pointerId) return
     const raycaster = new THREE.Raycaster()
-    raycaster.setFromCamera(pointer.ndc, this.cameraFor(this.dragState.view))
+    const ndc = this.pointerNdc(this.editorCanvas, event, this.editorViewports[this.dragState.view])
+    raycaster.setFromCamera(ndc, this.cameraFor(this.dragState.view))
     const line = new THREE.Line3(raycaster.ray.origin, raycaster.ray.origin.clone().add(raycaster.ray.direction.multiplyScalar(100000)))
     const point = this.dragState.plane.intersectLine(line, new THREE.Vector3())
     if (!point) return
@@ -981,14 +1316,18 @@ export class SceneManager {
     worldV[spec.v] = 1
     worldV.applyQuaternion(quaternion).normalize()
     position.addScaledVector(worldU, delta.dot(worldU)).addScaledVector(worldV, delta.dot(worldV))
-    const group = this.boxGroup.children.find((child) => child.userData.boxId === this.dragState?.boxId)
-    if (group) group.position.copy(position)
-    this.onTransform(this.dragState.boxId, { position: { x: position.x, y: position.y, z: position.z } })
+    this.dragState.change = { position: { x: position.x, y: position.y, z: position.z } }
+    this.applyBoxPreview(this.dragState.change)
   }
 
-  private handlePointerUp = () => {
-    if (this.dragState) this.onMoveEnd()
+  private handlePointerUp = (event: PointerEvent) => {
+    const drag = this.dragState
+    if (!drag || drag.pointerId !== event.pointerId) return
+    if (this.editorCanvas.hasPointerCapture(event.pointerId)) this.editorCanvas.releasePointerCapture(event.pointerId)
     this.dragState = null
+    this.previewBox = null
+    if (Object.keys(drag.change).length) this.onTransform(drag.boxId, drag.change)
     if (this.selectedBoxModel) this.focusEditorBox(this.selectedBoxModel)
+    this.onMoveEnd()
   }
 }

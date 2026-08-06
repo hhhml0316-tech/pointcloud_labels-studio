@@ -63,6 +63,10 @@ def create_app(config: AppConfig) -> FastAPI:
     def classes() -> list[dict[str, Any]]:
         return list(config.classes)
 
+    @app.get("/api/config/ai-box")
+    def ai_box_config() -> dict[str, Any]:
+        return config.ai_box
+
     @app.get("/api/sequences")
     def sequences() -> list[dict[str, Any]]:
         return [record.info.as_dict() for record in records.values()]

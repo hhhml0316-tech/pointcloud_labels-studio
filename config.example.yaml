@@ -23,6 +23,41 @@ classes:
     color: '#22C55E'
     default_size: [0.7, 0.7, 1.6]
 
+# 几何拟合参数。这里的值会作为前端初始值，界面中的“拟合参数”可在
+# 当前浏览器会话内继续微调。
+ai_box:
+  # Disabled by default so playback never spends time on geometry fitting.
+  enabled: false
+  minBoxSize: 0.2
+  heightRange: [-10000, 10000]
+  roadGridSize: 2.0
+  roadZStatSigmaLow: 2
+  roadZStatSigmaHigh: 1
+  roadCellLowestMargin: 0.5
+  roadOutlierK: 10
+  roadOutlierStdMul: 0
+  roadMaxSlopeDeg: 5
+  roadSlopeSearchMul: 20
+  roadQueryZOffset: 0.1
+  roadGap: 0.1
+  minPointsAfterRoadFilter: 10
+  enableDenoise: true
+  minFilterPoints: 100
+  dbscanEps: 0.5
+  dbscanMinPts: 3
+  angleSearch:
+    round1Count: 10
+    round2Count: 11
+    round3Count: 9
+  edgeGap: 0.5
+  lossScale: 50
+  preferLongEdgeAsX: true
+  useHeadAngle: true
+  headFlipThresholdRad: 1.5707963267948966
+  existingBoxFitPaddingRatio: 0.2
+  useWorker: true
+  # maxPointsForFit: 20000
+
 server:
   host: 127.0.0.1
   port: 8000

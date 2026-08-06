@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node node_modules/vite/bin/vite.js",
     "build": "node node_modules/typescript/bin/tsc --noEmit && node node_modules/vite/bin/vite.js build",
-    "preview": "node node_modules/vite/bin/vite.js preview"
+    "preview": "node node_modules/vite/bin/vite.js preview",
+    "test:ai-box": "node --test tools/test_ai_box.mjs"
   },
   "dependencies": {
     "three": "^0.176.0",

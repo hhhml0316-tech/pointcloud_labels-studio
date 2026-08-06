@@ -1,4 +1,4 @@
-import type { ClassConfig, FrameInfo, LabelsResponse, LabelBox, PointFrame, SequenceInfo } from './types'
+import type { AIBoxConfig, ClassConfig, FrameInfo, LabelsResponse, LabelBox, PointFrame, SequenceInfo } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -19,6 +19,7 @@ export const api = {
   sequences: () => request<SequenceInfo[]>('/api/sequences'),
   frames: (sequenceId: string) => request<FrameInfo[]>(`/api/sequences/${encodeURIComponent(sequenceId)}/frames`),
   classes: () => request<ClassConfig[]>('/api/config/classes'),
+  aiBoxConfig: () => request<AIBoxConfig>('/api/config/ai-box'),
   labels: (sequenceId: string, frameId: string) =>
     request<LabelsResponse>(`/api/sequences/${encodeURIComponent(sequenceId)}/frames/${encodeURIComponent(frameId)}/labels`),
   points: async (sequenceId: string, frameId: string): Promise<ArrayBuffer> => {
