@@ -207,3 +207,26 @@ def test_ai_box_config_is_merged_and_exposed(tmp_path: Path) -> None:
     response = TestClient(create_app(config)).get("/api/config/ai-box")
     assert response.status_code == 200
     assert response.json()["roadGap"] == 0.25
+
+
+def test_static_assets_use_strict_mime_types(tmp_path: Path) -> None:
+    # Browsers enforce strict MIME checking for module scripts; serving .js
+    # as text/plain (Windows registry without a .js association) breaks them.
+    dist_dir = Path(__file__).resolve().parent.parent / "dist"
+    js_files = sorted(dist_dir.glob("assets/*.js")) if dist_dir.is_dir() else []
+    css_files = sorted(dist_dir.glob("assets/*.css")) if dist_dir.is_dir() else []
+    if not js_files or not css_files:
+        pytest.skip("dist/ has not been built")
+    lidar = tmp_path / "lidar"
+    lidar.mkdir()
+    write_bin(lidar / "frame1.bin", [(1, 2, 3, 4)])
+    config = AppConfig(sequences=(SequenceConfig("demo", lidar, None),), classes=({"id": "Car"},))
+    client = TestClient(create_app(config))
+
+    js_response = client.get(f"/assets/{js_files[0].name}")
+    assert js_response.status_code == 200
+    assert js_response.headers["content-type"].startswith("application/javascript")
+
+    css_response = client.get(f"/assets/{css_files[0].name}")
+    assert css_response.status_code == 200
+    assert css_response.headers["content-type"].startswith("text/css")

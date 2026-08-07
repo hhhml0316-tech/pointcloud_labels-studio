@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,17 @@ from .config import AppConfig
 from .indexer import index_config
 from .labels import load_labels, save_labels, validate_labels
 from .models import SequenceRecord
+
+# On Windows, mimetypes reads file associations from the registry, and clean
+# machines often lack a .js entry. StaticFiles then falls back to
+# "text/plain", and browsers refuse to execute module scripts served with the
+# wrong MIME type. Register web asset types explicitly so static serving
+# never depends on OS-level file associations.
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("application/wasm", ".wasm")
 
 
 def create_app(config: AppConfig) -> FastAPI:
