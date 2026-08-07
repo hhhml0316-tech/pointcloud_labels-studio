@@ -138,6 +138,45 @@ def test_api_lidar_only_sequence_uses_sibling_label_dir(tmp_path: Path) -> None:
     assert (tmp_path / "sequence" / "label" / "frame1.json").is_file()
 
 
+def test_api_remap_track_id_across_sequence(tmp_path: Path) -> None:
+    lidar = tmp_path / "lidar"
+    labels = tmp_path / "label"
+    lidar.mkdir()
+    labels.mkdir()
+    for name in ("frame1.bin", "frame2.bin", "frame3.bin"):
+        write_bin(lidar / name, [(1, 2, 3, 4)])
+
+    box_a = sample_labels()[0]
+    box_b = {**sample_labels()[0], "obj_id": "2"}
+    box_conflict = {**sample_labels()[0], "obj_id": "9"}
+    (labels / "frame1.json").write_text(json.dumps([box_a]), encoding="utf-8")
+    (labels / "frame2.json").write_text(json.dumps([box_a, box_conflict]), encoding="utf-8")
+    (labels / "frame3.json").write_text(json.dumps([box_b]), encoding="utf-8")
+
+    config = AppConfig(
+        sequences=(SequenceConfig("demo", lidar, labels),),
+        classes=({"id": "Car", "label": "Car"}, {"id": "Pedestrain", "label": "Pedestrian"}),
+    )
+    client = TestClient(create_app(config))
+
+    response = client.post("/api/sequences/demo/remap-track-id", json={"from_id": "1", "to_id": "9"})
+    assert response.status_code == 200
+    payload = response.json()
+    # frame2 contains both ID 1 and ID 9, so it must be skipped, not merged.
+    assert payload["updated_frames"] == ["frame1"]
+    assert [item["frame_id"] for item in payload["skipped_frames"]] == ["frame2"]
+    assert [box["obj_id"] for box in json.loads((labels / "frame1.json").read_text(encoding="utf-8"))] == ["9"]
+    assert (labels / "frame1.json.bak").is_file()
+
+    response = client.post("/api/sequences/demo/remap-track-id", json={"from_id": "2", "to_id": "7"})
+    assert response.status_code == 200
+    assert response.json()["updated_frames"] == ["frame3"]
+    assert [box["obj_id"] for box in json.loads((labels / "frame3.json").read_text(encoding="utf-8"))] == ["7"]
+
+    response = client.post("/api/sequences/demo/remap-track-id", json={"from_id": "4", "to_id": "4"})
+    assert response.status_code == 422
+
+
 def test_ai_box_config_is_merged_and_exposed(tmp_path: Path) -> None:
     lidar = tmp_path / "lidar"
     lidar.mkdir()

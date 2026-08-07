@@ -32,6 +32,21 @@ export const api = {
       `/api/sequences/${encodeURIComponent(sequenceId)}/frames/${encodeURIComponent(frameId)}/labels`,
       { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boxes }) },
     ),
+  remapTrackId: (sequenceId: string, fromId: string, toId: string) =>
+    request<RemapTrackIdResponse>(`/api/sequences/${encodeURIComponent(sequenceId)}/remap-track-id`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_id: fromId, to_id: toId }),
+    }),
+}
+
+export type RemapTrackIdResponse = {
+  status: string
+  sequence_id: string
+  from_id: string
+  to_id: string
+  updated_frames: string[]
+  skipped_frames: { frame_id: string; reason: string }[]
 }
 
 type WorkerResponse = { requestId: number; frame: PointFrame; error?: undefined } | { requestId: number; error: string; frame?: undefined }

@@ -118,6 +118,7 @@ export class SceneManager {
   private shouldFitMainView = true
   private mainBoxLabels: MainBoxLabel[] = []
   private currentBoxes: LabelBox[] = []
+  private lastLabelClick: { x: number; y: number; time: number; ids: string; index: number } | null = null
   private readonly boxSelectionRect = document.createElement('div')
   private boxCreationMode = false
   private boxDrawState: BoxDrawState | null = null
@@ -843,8 +844,7 @@ export class SceneManager {
     label.addEventListener('pointerdown', (event) => event.stopPropagation())
     label.addEventListener('click', (event) => {
       event.stopPropagation()
-      this.selectedId = id
-      this.onSelect(id)
+      this.selectLabelAtPoint(event.clientX, event.clientY, id)
     })
     label.addEventListener('contextmenu', (event) => {
       event.preventDefault()
@@ -858,6 +858,28 @@ export class SceneManager {
       element: label,
       center: new THREE.Vector3(box.psr.position.x, box.psr.position.y, box.psr.position.z),
     })
+  }
+
+  private selectLabelAtPoint(clientX: number, clientY: number, fallbackId: string) {
+    // Multiple labels can overlap; elementsFromPoint returns them top-most
+    // first. A quick repeat click at the same spot cycles through the stack,
+    // making labels hidden underneath others selectable too.
+    const stack = (document.elementsFromPoint(clientX, clientY) as HTMLElement[])
+      .filter((element) => element.classList.contains('main-box-label') && element.dataset.boxId)
+      .map((element) => element.dataset.boxId as string)
+    const ids = stack.length ? stack : [fallbackId]
+    const key = ids.join('\u0000')
+    const now = performance.now()
+    const last = this.lastLabelClick
+    const repeated = !!last
+      && now - last.time < 650
+      && Math.hypot(clientX - last.x, clientY - last.y) <= 8
+      && last.ids === key
+    const index = repeated && last ? (last.index + 1) % ids.length : 0
+    const nextId = ids[index]
+    this.selectedId = nextId
+    this.onSelect(nextId)
+    this.lastLabelClick = { x: clientX, y: clientY, time: now, ids: key, index }
   }
 
   private clearMainBoxLabels() {

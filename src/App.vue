@@ -5,6 +5,7 @@ import { createAIBoxConfig, DEFAULT_AI_BOX_CONFIG } from './ai-box/config.js'
 import { api, PointWorkerClient } from './api'
 import { PointFrameCache } from './pointCache'
 import { SceneManager } from './render/SceneManager'
+import { isProbablySameTarget, spatialMetric } from './trackUtils'
 import type { AIBoxConfig, AIBoxFitResult, AIBoxSelection, ClassConfig, FrameInfo, LabelBox, PointFrame, SequenceInfo, Vec3 } from './types'
 
 type NumericSection = 'position' | 'scale' | 'rotation'
@@ -20,6 +21,17 @@ type AIConfigNumberField = {
   min?: number
   max?: number
   optional?: boolean
+}
+
+type MergeDecision = 'source' | 'target' | 'keep'
+type MergeConflict = { source: LabelBox; target: LabelBox; iou: number; distance: number }
+type MergePlan = {
+  direction: -1 | 1
+  targetFrame: FrameInfo
+  sources: LabelBox[]
+  retained: LabelBox[]
+  conflicts: MergeConflict[]
+  replacedCount: number
 }
 
 const mainCanvas = ref<HTMLCanvasElement | null>(null)
@@ -51,6 +63,8 @@ const showNewBoxTypes = ref(false)
 const isAIFitting = ref(false)
 const showAISettings = ref(false)
 const isCopyingAdjacent = ref(false)
+const mergePlan = ref<MergePlan | null>(null)
+const conflictDecisions = ref<Record<string, MergeDecision>>({})
 const aiBoxConfig = ref<AIBoxConfig>(createAIBoxConfig())
 const contextMenu = ref({
   visible: false,
@@ -60,6 +74,7 @@ const contextMenu = ref({
   typeOpen: false,
   idEditing: false,
   draftId: '',
+  applyToSequence: false,
 })
 const numericSections: NumericSection[] = ['position', 'scale', 'rotation']
 const axes: Axis[] = ['x', 'y', 'z']
@@ -458,6 +473,7 @@ function openBoxContextMenu(boxId: string, clientX: number, clientY: number) {
     typeOpen: false,
     idEditing: false,
     draftId: boxId,
+    applyToSequence: false,
   }
 }
 
@@ -490,7 +506,7 @@ function beginContextIdEdit() {
   contextMenu.value.draftId = contextMenu.value.boxId
 }
 
-function commitContextId() {
+async function commitContextId() {
   const oldId = contextMenu.value.boxId
   const box = boxes.value.find((item) => String(item.obj_id) === oldId)
   if (!box) return
@@ -503,12 +519,32 @@ function commitContextId() {
     setError(`ID ${nextId} 在当前帧中已存在`)
     return
   }
-  beginEdit()
-  box.obj_id = nextId
-  selectedBoxId.value = nextId
-  maxObservedNumericId = Math.max(maxObservedNumericId, Number(nextId))
-  dirty.value = true
+  const applyToSequence = contextMenu.value.applyToSequence
   closeContextMenu()
+  if (!applyToSequence) {
+    beginEdit()
+    box.obj_id = nextId
+    selectedBoxId.value = nextId
+    maxObservedNumericId = Math.max(maxObservedNumericId, Number(nextId))
+    dirty.value = true
+    return
+  }
+  try {
+    isLoading.value = true
+    const result = await api.remapTrackId(sequenceId.value, oldId, nextId)
+    // The backend already rewrote every label file, including this frame.
+    const current = boxes.value.find((item) => String(item.obj_id) === oldId)
+    if (current) current.obj_id = nextId
+    selectedBoxId.value = nextId
+    maxObservedNumericId = Math.max(maxObservedNumericId, Number(nextId))
+    const skipped = result.skipped_frames
+    setNotice(`序列级重映射完成：${result.updated_frames.length} 帧已将 ID ${oldId} 改为 ${nextId}`
+      + `${skipped.length ? `；${skipped.length} 帧跳过（${skipped.map((item) => item.frame_id).join('、')}）` : ''}`)
+  } catch (error) {
+    setError(error)
+  } finally {
+    isLoading.value = false
+  }
 }
 
 async function refitContextBox() {
@@ -610,57 +646,112 @@ function deleteSelected() {
   dirty.value = true
 }
 
-async function copyFromAdjacent(direction: -1 | 1) {
-  const selectedId = selectedBoxId.value
-  const activeFrameId = currentFrame.value?.frame_id
-  const activeSequenceId = sequenceId.value
-  if (!selectedId || !activeFrameId) return
-  const sourceIndex = frameIndex.value + direction
-  if (sourceIndex < 0 || sourceIndex >= frames.value.length) return
-  try {
-    const response = await api.labels(activeSequenceId, frames.value[sourceIndex].frame_id)
-    if (sequenceId.value !== activeSequenceId || currentFrame.value?.frame_id !== activeFrameId) return
-    const source = response.boxes.find((box) => String(box.obj_id) === selectedId)
-    if (!source) {
-      setNotice('相邻帧没有相同 ID 的对象')
-      return
-    }
-    beginEdit()
-    const target = boxes.value.find((box) => String(box.obj_id) === String(source.obj_id))
-    if (target) Object.assign(target, clone(source))
-    else boxes.value.push(clone(source))
-    dirty.value = true
-    setNotice('已复制相邻帧对象')
-  } catch (error) {
-    setError(error)
-  }
+function conflictKey(conflict: MergeConflict) {
+  return `${String(conflict.source.obj_id)}\u0000${String(conflict.target.obj_id)}`
+}
+
+function classLabel(objType: string) {
+  return classes.value.find((item) => item.id === objType)?.label ?? objType
+}
+
+async function copySelectedToAdjacent(direction: -1 | 1) {
+  const selected = selectedBox.value
+  if (!selected) return
+  await pushBoxesToAdjacent([clone(selected)], direction)
 }
 
 async function copyAllToAdjacent(direction: -1 | 1) {
-  const targetIndex = frameIndex.value + direction
   if (!boxes.value.length) {
     setNotice('当前帧没有可复制的标注框')
     return
   }
+  await pushBoxesToAdjacent(clone(boxes.value), direction)
+}
+
+async function pushBoxesToAdjacent(sourceBoxes: LabelBox[], direction: -1 | 1) {
+  const targetIndex = frameIndex.value + direction
+  if (!sourceBoxes.length) return
   if (targetIndex < 0 || targetIndex >= frames.value.length || isCopyingAdjacent.value) return
   const targetFrame = frames.value[targetIndex]
   const activeSequenceId = sequenceId.value
+  const activeFrameId = currentFrame.value?.frame_id
   try {
     isCopyingAdjacent.value = true
     const response = await api.labels(activeSequenceId, targetFrame.frame_id)
-    const sourceBoxes = clone(boxes.value)
+    if (sequenceId.value !== activeSequenceId || currentFrame.value?.frame_id !== activeFrameId) return
     const sourceIds = new Set(sourceBoxes.map((box) => String(box.obj_id)))
-    const retainedTargetBoxes = response.boxes.filter((box) => !sourceIds.has(String(box.obj_id)))
-    const replacedCount = response.boxes.length - retainedTargetBoxes.length
-    const result = await api.saveLabels(activeSequenceId, targetFrame.frame_id, [
-      ...retainedTargetBoxes.map((box) => clone(box)),
-      ...sourceBoxes,
-    ])
-    setNotice(
-      `已将当前帧 ${sourceBoxes.length} 个框复制到${direction < 0 ? '上一帧' : '下一帧'}`
-      + `${replacedCount ? `，更新 ${replacedCount} 个同 ID 框` : ''}`
-      + `${result.warnings.length ? `；${result.warnings.length} 条校验提示` : ''}`,
-    )
+    const retained = response.boxes.filter((box) => !sourceIds.has(String(box.obj_id)))
+    // Spatial dedupe: boxes kept only in the target frame may still describe
+    // the same physical target as a source box under a different Track ID.
+    const conflicts: MergeConflict[] = []
+    for (const source of sourceBoxes) {
+      for (const target of retained) {
+        const metric = spatialMetric(source, target)
+        if (isProbablySameTarget(metric)) conflicts.push({ source, target, iou: metric.iou, distance: metric.distance })
+      }
+    }
+    const plan: MergePlan = {
+      direction,
+      targetFrame,
+      sources: sourceBoxes,
+      retained,
+      conflicts,
+      replacedCount: response.boxes.length - retained.length,
+    }
+    if (!conflicts.length) {
+      await applyMerge(plan, {})
+      return
+    }
+    conflictDecisions.value = Object.fromEntries(conflicts.map((conflict) => [conflictKey(conflict), 'source' as MergeDecision]))
+    mergePlan.value = plan
+  } catch (error) {
+    setError(error)
+  } finally {
+    isCopyingAdjacent.value = false
+  }
+}
+
+async function confirmMerge() {
+  const plan = mergePlan.value
+  if (!plan) return
+  const decisions = conflictDecisions.value
+  mergePlan.value = null
+  await applyMerge(plan, decisions)
+}
+
+async function applyMerge(plan: MergePlan, decisions: Record<string, MergeDecision>) {
+  const removedTargetIds = new Set<string>()
+  const usedTargetIds = new Set<string>()
+  const sourceIdOverrides = new Map<string, string>()
+  for (const conflict of plan.conflicts) {
+    const decision = decisions[conflictKey(conflict)] ?? 'keep'
+    if (decision === 'keep') continue
+    removedTargetIds.add(String(conflict.target.obj_id))
+    if (decision === 'target') {
+      const targetId = String(conflict.target.obj_id)
+      if (!usedTargetIds.has(targetId)) {
+        usedTargetIds.add(targetId)
+        sourceIdOverrides.set(String(conflict.source.obj_id), targetId)
+      }
+    }
+  }
+  const retained = plan.retained.filter((box) => !removedTargetIds.has(String(box.obj_id))).map((box) => clone(box))
+  const pushed = plan.sources.map((box) => {
+    const copied = clone(box)
+    const override = sourceIdOverrides.get(String(copied.obj_id))
+    if (override) copied.obj_id = override
+    return copied
+  })
+  const unifiedCount = plan.conflicts.filter((conflict) => (decisions[conflictKey(conflict)] ?? 'keep') !== 'keep').length
+  try {
+    isCopyingAdjacent.value = true
+    const result = await api.saveLabels(sequenceId.value, plan.targetFrame.frame_id, [...retained, ...pushed])
+    const directionText = plan.direction < 0 ? '上一帧' : '下一帧'
+    let message = `已将当前帧 ${plan.sources.length} 个框复制到${directionText}`
+    if (plan.replacedCount) message += `，更新 ${plan.replacedCount} 个同 ID 框`
+    if (unifiedCount) message += `，统一 ${unifiedCount} 对重复目标`
+    if (result.warnings.length) message += `；${result.warnings.length} 条校验提示`
+    setNotice(message)
   } catch (error) {
     setError(error)
   } finally {
@@ -675,7 +766,8 @@ function handleKeydown(event: KeyboardEvent) {
   } else if (event.key === 'Delete') {
     deleteSelected()
   } else if (event.key === 'Escape') {
-    if (pendingNewClass.value || showNewBoxTypes.value) cancelNewBoxCreation()
+    if (mergePlan.value) mergePlan.value = null
+    else if (pendingNewClass.value || showNewBoxTypes.value) cancelNewBoxCreation()
     else if (contextMenu.value.visible) closeContextMenu()
     else selectedBoxId.value = null
   } else if (event.key === 'ArrowLeft' && !(event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || event.target instanceof HTMLTextAreaElement)) {
@@ -906,8 +998,8 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="adjacent-actions">
-            <button class="button" :disabled="frameIndex <= 0" @click="copyFromAdjacent(-1)">从上一帧同步此框</button>
-            <button class="button" :disabled="frameIndex >= frames.length - 1" @click="copyFromAdjacent(1)">从下一帧同步此框</button>
+            <button class="button" :disabled="frameIndex <= 0 || isCopyingAdjacent" @click="copySelectedToAdjacent(-1)">复制此框到上一帧</button>
+            <button class="button" :disabled="frameIndex >= frames.length - 1 || isCopyingAdjacent" @click="copySelectedToAdjacent(1)">复制此框到下一帧</button>
           </div>
         </div>
         <div v-else class="selection-hint">选择对象后可在这里编辑类别、ID、位置、尺寸和旋转。</div>
@@ -948,10 +1040,54 @@ onUnmounted(() => {
           @keydown.escape.prevent="contextMenu.idEditing = false"
         >
         <button class="button primary" @click="commitContextId">确定</button>
+        <label class="context-remap-option" title="勾选后，整个序列所有帧中的该 Track ID 都会一并改名，用于修正跨帧 ID 不一致">
+          <input type="checkbox" v-model="contextMenu.applyToSequence">
+          <span>应用到整个序列（所有帧同步改名）</span>
+        </label>
       </div>
       <div class="floating-menu-separator"></div>
       <button class="floating-menu-item" :disabled="isAIFitting" @click="refitContextBox">重新执行几何拟合</button>
       <button class="floating-menu-item danger" @click="deleteSelected(); closeContextMenu()">删除标注框</button>
+    </div>
+
+    <div v-if="mergePlan" class="modal-backdrop" @pointerdown.self="mergePlan = null">
+      <section class="track-modal">
+        <header class="modal-header">
+          <div>
+            <h2>检测到疑似重复目标</h2>
+            <p>复制到「{{ mergePlan.targetFrame.frame_id }}」时，发现 ID 不同但空间上重叠的框，请为每一对选择处理方式。</p>
+          </div>
+          <button class="icon-button" aria-label="关闭" @click="mergePlan = null">×</button>
+        </header>
+        <div class="track-modal-body">
+          <div v-for="conflict in mergePlan.conflicts" :key="conflictKey(conflict)" class="conflict-card">
+            <div class="conflict-title">
+              <span>当前帧 #{{ conflict.source.obj_id }}（{{ classLabel(conflict.source.obj_type) }}）</span>
+              <span class="conflict-arrow">⇄</span>
+              <span>目标帧 #{{ conflict.target.obj_id }}（{{ classLabel(conflict.target.obj_type) }}）</span>
+              <small>IoU {{ conflict.iou.toFixed(2) }} · 中心距 {{ conflict.distance.toFixed(2) }} m</small>
+            </div>
+            <div class="conflict-options">
+              <label class="decision-option">
+                <input type="radio" :name="conflictKey(conflict)" value="source" v-model="conflictDecisions[conflictKey(conflict)]">
+                <span>统一为当前帧 #{{ conflict.source.obj_id }}（丢弃目标帧的框）</span>
+              </label>
+              <label class="decision-option">
+                <input type="radio" :name="conflictKey(conflict)" value="target" v-model="conflictDecisions[conflictKey(conflict)]">
+                <span>统一为目标帧 #{{ conflict.target.obj_id }}（保留该 ID，几何用当前帧）</span>
+              </label>
+              <label class="decision-option">
+                <input type="radio" :name="conflictKey(conflict)" value="keep" v-model="conflictDecisions[conflictKey(conflict)]">
+                <span>不是同一目标，保留两个框</span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <footer class="modal-footer">
+          <button class="button" @click="mergePlan = null">取消</button>
+          <button class="button primary" :disabled="isCopyingAdjacent" @click="confirmMerge">确认并保存到目标帧</button>
+        </footer>
+      </section>
     </div>
 
     <div v-if="showAISettings" class="modal-backdrop" @pointerdown.self="showAISettings = false">

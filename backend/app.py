@@ -20,7 +20,7 @@ def create_app(config: AppConfig) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(config.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "PUT", "OPTIONS"],
+        allow_methods=["GET", "PUT", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -108,6 +108,73 @@ def create_app(config: AppConfig) -> FastAPI:
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"status": "saved", "sequence_id": sequence_id, "frame_id": frame_id, **result}
+
+    def existing_label_file(record: SequenceRecord, frame: Any) -> Path | None:
+        # Mirror label_path(): configured label_dir wins; lidar-only sequences
+        # fall back to the conventional sibling directory used on first save.
+        if record.label_dir is not None:
+            path = record.label_dir / f"{frame.frame_id}.json"
+        else:
+            path = record.lidar_dir.parent / "label" / f"{frame.frame_id}.json"
+        return path if path.is_file() else None
+
+    @app.post("/api/sequences/{sequence_id}/remap-track-id")
+    async def remap_track_id(sequence_id: str, request: Request) -> dict[str, Any]:
+        record = get_record(sequence_id)
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="request body must be JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=422, detail="request body must be an object")
+        from_id = body.get("from_id")
+        to_id = body.get("to_id")
+        from_key = str(from_id).strip() if from_id is not None else ""
+        to_key = str(to_id).strip() if to_id is not None else ""
+        if not from_key or not to_key:
+            raise HTTPException(status_code=422, detail="from_id and to_id are required")
+        if from_key == to_key:
+            raise HTTPException(status_code=422, detail="from_id and to_id must differ")
+
+        updated_frames: list[str] = []
+        skipped_frames: list[dict[str, str]] = []
+        for frame in record.frames:
+            path = existing_label_file(record, frame)
+            if path is None:
+                continue
+            try:
+                boxes = load_labels(path)
+            except (OSError, ValueError) as exc:
+                skipped_frames.append({"frame_id": frame.frame_id, "reason": f"标签读取失败：{exc}"})
+                continue
+            if not any(isinstance(box, dict) and str(box.get("obj_id")) == from_key for box in boxes):
+                continue
+            if any(isinstance(box, dict) and str(box.get("obj_id")) == to_key for box in boxes):
+                skipped_frames.append(
+                    {
+                        "frame_id": frame.frame_id,
+                        "reason": f"同一帧已存在 ID {to_key}，为避免把两个框合并成一个 ID 而跳过",
+                    }
+                )
+                continue
+            for box in boxes:
+                if isinstance(box, dict) and str(box.get("obj_id")) == from_key:
+                    # Preserve numeric JSON typing when both sides are numeric.
+                    box["obj_id"] = int(to_key) if isinstance(box.get("obj_id"), int) and to_key.isdigit() else to_key
+            try:
+                save_labels(path, boxes, set(class_map))
+            except (OSError, ValueError) as exc:
+                skipped_frames.append({"frame_id": frame.frame_id, "reason": f"标签保存失败：{exc}"})
+                continue
+            updated_frames.append(frame.frame_id)
+        return {
+            "status": "ok",
+            "sequence_id": sequence_id,
+            "from_id": from_key,
+            "to_id": to_key,
+            "updated_frames": updated_frames,
+            "skipped_frames": skipped_frames,
+        }
 
     # A production build can be served by the same local process. During
     # development Vite serves the frontend and proxies /api to this app.
