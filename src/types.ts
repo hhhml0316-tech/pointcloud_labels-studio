@@ -42,6 +42,19 @@ export type LabelsResponse = {
   label_exists: boolean
 }
 
+export type TrajectoryPoint = {
+  frame_id: string
+  frame_index: number
+  obj_type: string
+  position: Vec3
+}
+
+export type TrackResponse = {
+  sequence_id: string
+  track_id: string
+  points: TrajectoryPoint[]
+}
+
 export type PointFrame = {
   frameId: string
   positions: Float32Array

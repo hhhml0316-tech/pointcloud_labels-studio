@@ -130,6 +130,51 @@ def create_app(config: AppConfig) -> FastAPI:
             path = record.lidar_dir.parent / "label" / f"{frame.frame_id}.json"
         return path if path.is_file() else None
 
+    @app.get("/api/sequences/{sequence_id}/tracks/{track_id}")
+    def track(sequence_id: str, track_id: str) -> dict[str, Any]:
+        record = get_record(sequence_id)
+        track_key = str(track_id)
+        points: list[dict[str, Any]] = []
+        for frame_index, frame in enumerate(record.frames):
+            path = existing_label_file(record, frame)
+            if path is None:
+                continue
+            try:
+                boxes = load_labels(path)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"{frame.frame_id}: {exc}") from exc
+            box = next(
+                (
+                    item
+                    for item in boxes
+                    if isinstance(item, dict) and str(item.get("obj_id")) == track_key
+                ),
+                None,
+            )
+            if box is None:
+                continue
+            psr = box.get("psr")
+            position = psr.get("position") if isinstance(psr, dict) else None
+            if not isinstance(position, dict):
+                continue
+            points.append(
+                {
+                    "frame_id": frame.frame_id,
+                    "frame_index": frame_index,
+                    "obj_type": str(box.get("obj_type", "")),
+                    "position": {
+                        "x": position.get("x"),
+                        "y": position.get("y"),
+                        "z": position.get("z"),
+                    },
+                }
+            )
+        return {
+            "sequence_id": sequence_id,
+            "track_id": track_key,
+            "points": points,
+        }
+
     @app.post("/api/sequences/{sequence_id}/remap-track-id")
     async def remap_track_id(sequence_id: str, request: Request) -> dict[str, Any]:
         record = get_record(sequence_id)

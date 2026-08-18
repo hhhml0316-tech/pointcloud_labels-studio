@@ -1,4 +1,4 @@
-import type { AIBoxConfig, ClassConfig, FrameInfo, LabelsResponse, LabelBox, PointFrame, SequenceInfo } from './types'
+import type { AIBoxConfig, ClassConfig, FrameInfo, LabelsResponse, LabelBox, PointFrame, SequenceInfo, TrackResponse } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -22,6 +22,8 @@ export const api = {
   aiBoxConfig: () => request<AIBoxConfig>('/api/config/ai-box'),
   labels: (sequenceId: string, frameId: string) =>
     request<LabelsResponse>(`/api/sequences/${encodeURIComponent(sequenceId)}/frames/${encodeURIComponent(frameId)}/labels`),
+  track: (sequenceId: string, trackId: string) =>
+    request<TrackResponse>(`/api/sequences/${encodeURIComponent(sequenceId)}/tracks/${encodeURIComponent(trackId)}`),
   points: async (sequenceId: string, frameId: string): Promise<ArrayBuffer> => {
     const response = await fetch(`/api/sequences/${encodeURIComponent(sequenceId)}/frames/${encodeURIComponent(frameId)}/points`)
     if (!response.ok) throw new Error(`point file request failed: ${response.status}`)

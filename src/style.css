@@ -45,10 +45,16 @@ select:focus, input:focus { border-color: #38bdf8; }
 .main-box-labels { position: absolute; inset: 0; z-index: 2; overflow: hidden; pointer-events: none; }
 .ai-box-selection-rect { position: absolute; border: 2px solid #38bdf8; background: rgba(56, 189, 248, .12); box-shadow: 0 0 0 1px rgba(7, 13, 23, .8), 0 0 18px rgba(56, 189, 248, .28); }
 .main-box-label { --box-label-color: #94a3b8; position: absolute; display: inline-flex; align-items: baseline; gap: 4px; padding: 2px 4px; transform: translate(-50%, -50%); border-radius: 3px; background: rgba(4, 10, 18, .58); color: var(--box-label-color); font: 600 10px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; text-shadow: 0 1px 2px #000, 0 0 3px #000; pointer-events: auto; cursor: pointer; }
+.main-box-label:hover { color: #fff; background: rgba(15, 35, 55, .94); outline: 1px solid var(--box-label-color); }
 .main-box-label.selected { color: #fff; background: rgba(18, 40, 63, .88); outline: 1px solid #fde047; }
 .main-box-label-id { color: #ffe566; }
 .viewport-caption { position: absolute; z-index: 2; padding: 4px 7px; color: #7f9ab7; background: rgba(6, 13, 23, .66); border: 1px solid #213753; border-radius: 5px; font-size: 10px; letter-spacing: .08em; pointer-events: none; }
 .main-caption { left: 12px; top: 12px; color: #c8e7ff; }.main-view-help { position: absolute; left: 14px; bottom: 12px; z-index: 2; color: #7690ad; font-size: 11px; pointer-events: none; }
+.trajectory-status { position: absolute; z-index: 3; top: 12px; right: 12px; display: flex; align-items: center; gap: 12px; padding: 6px 9px; border: 1px solid #2b6581; border-radius: 6px; color: #d9f7ff; background: rgba(5, 22, 35, .86); font: 11px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace; pointer-events: none; }
+.trajectory-status.error { max-width: 48%; border-color: #9f4751; color: #fecdd3; background: rgba(60, 20, 27, .9); }
+.trajectory-legend { display: inline-flex; align-items: center; gap: 4px; color: #7894ad; font-size: 9px; }
+.trajectory-legend i { width: 7px; height: 7px; margin-left: 4px; border-radius: 50%; box-shadow: 0 0 5px currentColor; }
+.trajectory-legend .past { color: #22d3ee; background: currentColor; }.trajectory-legend .current { color: #fde047; background: currentColor; }.trajectory-legend .future { color: #fb923c; background: currentColor; }
 .ai-draw-hint { position: absolute; z-index: 4; left: 50%; top: 16px; transform: translateX(-50%); padding: 7px 12px; border: 1px solid #38bdf8; border-radius: 7px; color: #e0f2fe; background: rgba(3, 31, 50, .9); font-size: 12px; pointer-events: none; }
 .ai-fitting-overlay { position: absolute; z-index: 5; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid #2f7299; border-radius: 8px; color: #dff6ff; background: rgba(7, 24, 39, .92); box-shadow: 0 12px 28px rgba(0,0,0,.35); pointer-events: none; }
 .ai-spinner { width: 16px; height: 16px; border: 2px solid #315775; border-top-color: #38bdf8; border-radius: 50%; animation: ai-spin .8s linear infinite; }

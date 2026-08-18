@@ -177,6 +177,37 @@ def test_api_remap_track_id_across_sequence(tmp_path: Path) -> None:
     assert response.status_code == 422
 
 
+def test_api_returns_ordered_track_trajectory(tmp_path: Path) -> None:
+    lidar = tmp_path / "lidar"
+    labels = tmp_path / "label"
+    lidar.mkdir()
+    labels.mkdir()
+    for name in ("frame1.bin", "frame2.bin", "frame3.bin"):
+        write_bin(lidar / name, [(1, 2, 3, 4)])
+
+    first = sample_labels()[0]
+    third = json.loads(json.dumps(first))
+    third["psr"]["position"] = {"x": 3.0, "y": 4.0, "z": 0.75}
+    (labels / "frame1.json").write_text(json.dumps([first]), encoding="utf-8")
+    (labels / "frame2.json").write_text("[]", encoding="utf-8")
+    (labels / "frame3.json").write_text(json.dumps([third]), encoding="utf-8")
+    config = AppConfig(
+        sequences=(SequenceConfig("demo", lidar, labels),),
+        classes=({"id": "Pedestrain", "label": "Pedestrian"},),
+    )
+
+    response = TestClient(create_app(config)).get("/api/sequences/demo/tracks/1")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["track_id"] == "1"
+    assert [(point["frame_id"], point["frame_index"]) for point in payload["points"]] == [
+        ("frame1", 0),
+        ("frame3", 2),
+    ]
+    assert payload["points"][1]["position"] == {"x": 3.0, "y": 4.0, "z": 0.75}
+    assert TestClient(create_app(config)).get("/api/sequences/demo/tracks/missing").json()["points"] == []
+
+
 def test_ai_box_config_is_merged_and_exposed(tmp_path: Path) -> None:
     lidar = tmp_path / "lidar"
     lidar.mkdir()

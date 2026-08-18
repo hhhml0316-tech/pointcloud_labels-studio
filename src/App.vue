@@ -6,7 +6,7 @@ import { api, PointWorkerClient } from './api'
 import { PointFrameCache } from './pointCache'
 import { SceneManager } from './render/SceneManager'
 import { isProbablySameTarget, spatialMetric } from './trackUtils'
-import type { AIBoxConfig, AIBoxFitResult, AIBoxSelection, ClassConfig, FrameInfo, LabelBox, PointFrame, SequenceInfo, Vec3 } from './types'
+import type { AIBoxConfig, AIBoxFitResult, AIBoxSelection, ClassConfig, FrameInfo, LabelBox, PointFrame, SequenceInfo, TrackResponse, TrajectoryPoint, Vec3 } from './types'
 
 type NumericSection = 'position' | 'scale' | 'rotation'
 type Axis = 'x' | 'y' | 'z'
@@ -46,6 +46,9 @@ const frameIndex = ref(0)
 const boxes = ref<LabelBox[]>([])
 const points = ref<PointFrame | null>(null)
 const selectedBoxId = ref<string | null>(null)
+const selectedTrack = ref<TrackResponse | null>(null)
+const isTrajectoryLoading = ref(false)
+const trajectoryError = ref('')
 const pointSize = ref(1.5)
 const colorMode = ref<'intensity' | 'uniform' | 'height'>('intensity')
 const speed = ref(1)
@@ -114,10 +117,23 @@ let inputEditActive = false
 let dragEditActive = false
 let maxObservedNumericId = 0
 let aiOperationSerial = 0
+let trajectoryRequestSerial = 0
 
 const currentSequence = computed(() => sequences.value.find((item) => item.sequence_id === sequenceId.value))
 const currentFrame = computed(() => frames.value[frameIndex.value])
 const selectedBox = computed(() => boxes.value.find((box) => String(box.obj_id) === selectedBoxId.value))
+const isSelectedTrackStatic = computed(() => {
+  const trackPoints = selectedTrack.value?.points ?? []
+  if (trackPoints.length < 2) return false
+  const xs = trackPoints.map((point) => point.position.x)
+  const ys = trackPoints.map((point) => point.position.y)
+  const zs = trackPoints.map((point) => point.position.z)
+  return Math.hypot(
+    Math.max(...xs) - Math.min(...xs),
+    Math.max(...ys) - Math.min(...ys),
+    Math.max(...zs) - Math.min(...zs),
+  ) < 1
+})
 const classOptions = computed(() => {
   const values = new Map(classes.value.map((item) => [item.id, item]))
   boxes.value.forEach((box) => {
@@ -319,8 +335,46 @@ function togglePlayback() {
   playNext()
 }
 
+function fitMainView() {
+  scene?.fitMainView()
+}
+
 function selectBox(id: string | null) {
   selectedBoxId.value = id
+}
+
+async function loadSelectedTrajectory(trackId: string | null, nextSequenceId: string) {
+  const requestSerial = ++trajectoryRequestSerial
+  selectedTrack.value = null
+  trajectoryError.value = ''
+  if (!trackId || !nextSequenceId) {
+    isTrajectoryLoading.value = false
+    return
+  }
+  isTrajectoryLoading.value = true
+  try {
+    const result = await api.track(nextSequenceId, trackId)
+    if (requestSerial === trajectoryRequestSerial) {
+      selectedTrack.value = result
+    }
+  } catch (error) {
+    if (requestSerial === trajectoryRequestSerial) {
+      trajectoryError.value = error instanceof Error ? error.message : String(error)
+    }
+  } finally {
+    if (requestSerial === trajectoryRequestSerial) isTrajectoryLoading.value = false
+  }
+}
+
+function visibleTrajectory(): TrajectoryPoint[] {
+  if (!selectedTrack.value || selectedTrack.value.track_id !== selectedBoxId.value) return []
+  const currentId = currentFrame.value?.frame_id
+  const currentBox = selectedBox.value
+  return selectedTrack.value.points.map((point) => (
+    currentId && currentBox && point.frame_id === currentId
+      ? { ...point, obj_type: currentBox.obj_type, position: { ...currentBox.psr.position } }
+      : point
+  ))
 }
 
 function transformBox(id: string, change: { position?: Vec3; scale?: Vec3; rotation?: Vec3 }) {
@@ -798,6 +852,14 @@ watch([boxes, selectedBoxId], () => {
   scene?.setBoxes(boxes.value, selectedBoxId.value)
 }, { deep: true })
 
+watch([selectedBoxId, sequenceId], ([trackId, nextSequenceId]) => {
+  void loadSelectedTrajectory(trackId, nextSequenceId)
+})
+
+watch([selectedTrack, boxes, selectedBoxId, currentFrame], () => {
+  scene?.setTrajectory(visibleTrajectory(), currentFrame.value?.frame_id ?? null)
+}, { deep: true })
+
 watch([pointSize, colorMode], () => {
   scene?.setPointStyle(pointSize.value, colorMode.value)
 })
@@ -920,12 +982,21 @@ onUnmounted(() => {
             <label>点大小
               <input v-model.number="pointSize" class="range-input" type="range" min="0.5" max="6" step="0.1">
             </label>
+            <button class="button" title="显示整幅当前帧点云" @click="fitMainView">全景</button>
           </div>
         </div>
         <div class="main-viewport-shell">
           <canvas ref="mainCanvas" class="viewport-canvas"></canvas>
           <div ref="mainOverlay" class="main-box-labels"></div>
           <div class="viewport-caption main-caption">MAIN · BEV / XY 鸟瞰</div>
+          <div v-if="selectedBoxId" class="trajectory-status" :class="{ error: trajectoryError }">
+            <template v-if="isTrajectoryLoading">读取 #{{ selectedBoxId }} 完整轨迹…</template>
+            <template v-else-if="trajectoryError">轨迹读取失败：{{ trajectoryError }}</template>
+            <template v-else>
+              <span :title="isSelectedTrackStatic ? '多帧位置接近，轨迹点会在真实位置重叠显示' : ''">轨迹 #{{ selectedBoxId }} · {{ selectedTrack?.points.length ?? 0 }} 帧{{ isSelectedTrackStatic ? ' · 静止' : '' }}</span>
+              <span class="trajectory-legend"><i class="past"></i>历史 <i class="current"></i>当前 <i class="future"></i>后续</span>
+            </template>
+          </div>
           <div class="main-view-help">
             {{ pendingNewClass ? `新增 ${pendingNewClass.label}：BEV 左键拖出目标区域 · Esc 取消` : '拖拽旋转 · 滚轮缩放 · 中键平移 · 点击类别/ID 标签选择框' }}
           </div>

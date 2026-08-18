@@ -1,7 +1,10 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { Line2 } from 'three/examples/jsm/lines/Line2.js'
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js'
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 import { projectCornersToRect } from '../ai-box/interaction.js'
-import type { AIBoxSelection, ClassConfig, LabelBox, PointFrame, Vec3 } from '../types'
+import type { AIBoxSelection, ClassConfig, LabelBox, PointFrame, TrajectoryPoint, Vec3 } from '../types'
 
 export type ViewName = 'main' | 'bev' | 'front' | 'side'
 
@@ -40,6 +43,8 @@ type OverlayView = {
 type MainBoxLabel = {
   element: HTMLDivElement
   center: THREE.Vector3
+  width?: number
+  height?: number
 }
 
 type BoxDrawState = {
@@ -97,6 +102,7 @@ export class SceneManager {
   private readonly controls: OrbitControls
   private readonly pointGroup = new THREE.Group()
   private readonly boxGroup = new THREE.Group()
+  private readonly trajectoryGroup = new THREE.Group()
   private points: THREE.Points | null = null
   private editorPoints: THREE.Points | null = null
   private pointData: PointFrame | null = null
@@ -155,7 +161,8 @@ export class SceneManager {
     this.boxSelectionRect.className = 'ai-box-selection-rect'
     this.boxSelectionRect.hidden = true
     this.mainOverlay.append(this.boxSelectionRect)
-    this.scene.add(this.pointGroup, this.boxGroup)
+    this.trajectoryGroup.layers.set(0)
+    this.scene.add(this.pointGroup, this.boxGroup, this.trajectoryGroup)
     this.scene.add(new THREE.AmbientLight(0xffffff, 1))
     this.scene.add(new THREE.AxesHelper(5))
 
@@ -193,6 +200,10 @@ export class SceneManager {
 
   fitMainViewOnNextFrame() {
     this.shouldFitMainView = true
+  }
+
+  fitMainView() {
+    if (this.pointData) this.fitToPoints(this.pointData.positions)
   }
 
   setBoxCreationMode(enabled: boolean) {
@@ -320,6 +331,119 @@ export class SceneManager {
     }
   }
 
+  setTrajectory(points: TrajectoryPoint[], currentFrameId: string | null) {
+    for (const child of [...this.trajectoryGroup.children]) {
+      this.trajectoryGroup.remove(child)
+      this.disposeObject(child)
+    }
+    if (!points.length) return
+
+    const currentFrameIndex = points.find((point) => point.frame_id === currentFrameId)?.frame_index ?? -1
+    const positions = new Float32Array(points.length * 3)
+    const colors = new Float32Array(points.length * 3)
+    const color = new THREE.Color()
+    points.forEach((point, index) => {
+      positions[index * 3] = point.position.x
+      positions[index * 3 + 1] = point.position.y
+      positions[index * 3 + 2] = point.position.z
+      color.setHex(
+        point.frame_id === currentFrameId
+          ? 0xfde047
+          : point.frame_index < currentFrameIndex
+            ? 0x22d3ee
+            : 0xfb923c,
+      )
+      colors[index * 3] = color.r
+      colors[index * 3 + 1] = color.g
+      colors[index * 3 + 2] = color.b
+    })
+
+    if (points.length > 1) {
+      const lineGeometry = new LineGeometry()
+      lineGeometry.setPositions(Array.from(positions))
+      lineGeometry.setColors(Array.from(colors))
+      const lineMaterial = new LineMaterial({
+        linewidth: 3,
+        vertexColors: true,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.96,
+      })
+      lineMaterial.resolution.set(this.mainViewport.width, this.mainViewport.height)
+      const line = new Line2(lineGeometry, lineMaterial)
+      line.computeLineDistances()
+      line.renderOrder = 20
+      this.trajectoryGroup.add(line)
+    }
+    const markerGeometry = new THREE.BufferGeometry()
+    markerGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    markerGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    const firstPosition = points[0].position
+    const maximumOffset = points.reduce((maximum, point) => Math.max(
+      maximum,
+      Math.hypot(point.position.x - firstPosition.x, point.position.y - firstPosition.y, point.position.z - firstPosition.z),
+    ), 0)
+    const markers = new THREE.Points(
+      markerGeometry,
+      new THREE.PointsMaterial({ size: maximumOffset < 1 ? 10 : 7, sizeAttenuation: false, vertexColors: true, depthTest: false }),
+    )
+    markers.renderOrder = 21
+    this.trajectoryGroup.add(markers)
+
+    const current = points.find((point) => point.frame_id === currentFrameId)
+    if (current) {
+      const currentGeometry = new THREE.BufferGeometry()
+      currentGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+        current.position.x,
+        current.position.y,
+        current.position.z,
+      ], 3))
+      if (maximumOffset < 1) {
+        const hasPast = points.some((point) => point.frame_index < current.frame_index)
+        const hasFuture = points.some((point) => point.frame_index > current.frame_index)
+        const addStaticRing = (color: number, size: number) => {
+          const ring = new THREE.Points(
+            currentGeometry.clone(),
+            new THREE.ShaderMaterial({
+              uniforms: {
+                markerColor: { value: new THREE.Color(color) },
+                markerSize: { value: size },
+              },
+              vertexShader: `
+                uniform float markerSize;
+                void main() {
+                  gl_PointSize = markerSize;
+                  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+              `,
+              fragmentShader: `
+                uniform vec3 markerColor;
+                void main() {
+                  float radius = distance(gl_PointCoord, vec2(0.5));
+                  if (radius < 0.36 || radius > 0.5) discard;
+                  gl_FragColor = vec4(markerColor, 0.95);
+                }
+              `,
+              transparent: true,
+              depthTest: false,
+              depthWrite: false,
+            }),
+          )
+          ring.renderOrder = 22
+          this.trajectoryGroup.add(ring)
+        }
+        if (hasPast) addStaticRing(0x22d3ee, hasFuture ? 38 : 32)
+        if (hasFuture) addStaticRing(0xfb923c, hasPast ? 29 : 34)
+      }
+      const marker = new THREE.Points(
+        currentGeometry,
+        new THREE.PointsMaterial({ color: 0xfde047, size: 14, sizeAttenuation: false, depthTest: false }),
+      )
+      marker.renderOrder = 22
+      this.trajectoryGroup.add(marker)
+    }
+  }
+
   render() {
     this.resize()
     this.controls.update()
@@ -367,6 +491,10 @@ export class SceneManager {
     this.mainCamera.aspect = mainWidth / Math.max(1, mainHeight)
     this.mainCamera.updateProjectionMatrix()
     this.updateOrtho(this.boxCreationCamera, this.mainViewport, this.boxCreationHalfHeight)
+    this.trajectoryGroup.traverse((node) => {
+      const material = (node as Line2).material
+      if (material instanceof LineMaterial) material.resolution.set(mainWidth, mainHeight)
+    })
     this.layoutEditorOverlay(editorWidth, editorHeight)
   }
 
@@ -384,6 +512,7 @@ export class SceneManager {
     this.editorOverlay.replaceChildren()
     this.mainOverlay.replaceChildren()
     this.mainBoxLabels = []
+    this.disposeObject(this.trajectoryGroup)
     this.controls.dispose()
     this.mainRenderer.dispose()
     this.editorRenderer.dispose()
@@ -891,15 +1020,59 @@ export class SceneManager {
     const width = Math.max(1, this.mainCanvas.clientWidth)
     const height = Math.max(1, this.mainCanvas.clientHeight)
     const camera = this.activeMainCamera()
-    for (const { element, center } of this.mainBoxLabels) {
+    const candidates: Array<{
+      label: MainBoxLabel
+      x: number
+      y: number
+      depth: number
+      selected: boolean
+    }> = []
+    for (const label of this.mainBoxLabels) {
+      const { element, center } = label
       const projected = center.clone().project(camera)
       const visible = projected.z >= -1 && projected.z <= 1
         && projected.x >= -1 && projected.x <= 1
         && projected.y >= -1 && projected.y <= 1
       element.hidden = !visible
       if (!visible) continue
-      element.style.left = `${(projected.x + 1) * 0.5 * width}px`
-      element.style.top = `${(1 - projected.y) * 0.5 * height}px`
+      const x = (projected.x + 1) * 0.5 * width
+      const y = (1 - projected.y) * 0.5 * height
+      element.style.left = `${x}px`
+      element.style.top = `${y}px`
+      label.width ??= element.offsetWidth || 48
+      label.height ??= element.offsetHeight || 17
+      candidates.push({
+        label,
+        x,
+        y,
+        depth: projected.z,
+        selected: element.dataset.boxId === this.selectedId,
+      })
+    }
+
+    // Dense BEV scenes can project dozens of labels onto the same few pixels.
+    // Keep labels anchored to their actual boxes and declutter instead of
+    // moving text away from its target, which makes picking ambiguous.
+    candidates.sort((a, b) => Number(b.selected) - Number(a.selected) || a.depth - b.depth)
+    const occupied: Array<{ left: number; right: number; top: number; bottom: number }> = []
+    for (const candidate of candidates) {
+      const labelWidth = candidate.label.width ?? 48
+      const labelHeight = candidate.label.height ?? 17
+      const rect = {
+        left: candidate.x - labelWidth / 2 - 3,
+        right: candidate.x + labelWidth / 2 + 3,
+        top: candidate.y - labelHeight / 2 - 2,
+        bottom: candidate.y + labelHeight / 2 + 2,
+      }
+      const overlaps = occupied.some((other) => (
+        rect.left < other.right
+        && rect.right > other.left
+        && rect.top < other.bottom
+        && rect.bottom > other.top
+      ))
+      candidate.label.element.hidden = overlaps && !candidate.selected
+      candidate.label.element.style.zIndex = candidate.selected ? '2' : '1'
+      if (!overlaps || candidate.selected) occupied.push(rect)
     }
   }
 
@@ -993,6 +1166,10 @@ export class SceneManager {
     const bounds = new THREE.Box3().setFromBufferAttribute(attribute)
     const sphere = bounds.getBoundingSphere(new THREE.Sphere())
     if (!Number.isFinite(sphere.radius) || sphere.radius <= 0) return
+    this.fitToSphere(sphere)
+  }
+
+  private fitToSphere(sphere: THREE.Sphere) {
     const direction = this.mainCamera.position.clone().sub(this.controls.target)
     if (direction.lengthSq() < 1e-6) direction.set(0, -0.0002, 1)
     else direction.normalize()
